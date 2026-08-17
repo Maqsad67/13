@@ -1,0 +1,163 @@
+def monthend_posting(dl_df,fcnb_cgl_df,fcnb_currency,currency_list,posting_date_str,TARGET_BRANCH="01111",TRANSFER_CGL="1106505001"):
+    try:
+
+        print("TRANSFER_CGL =>>>>>>>>>>>>>>>>>>> {TRANSFER_CGL}")
+       
+        print("TARGET_BRANCH =>>>>>>>>>>>>>>>>>>> {TARGET_BRANCH}")
+       
+        # STEP 1: BASE DF
+        base_df = (
+            dl_df
+            .filter(F.col("closing_balance") != 0)
+            .withColumn("BRANCH_CODE", F.substring("glcc", 1, 5))
+            .withColumn("CURRENCY", F.substring("glcc", 6, 3))
+            .withColumn("CGL", F.substring("glcc", 9, 10))
+            .join(fcnb_cgl_df, F.col("CGL") == F.col("FROM_CGL"), "inner")
+            .join(
+                fcnb_currency,
+                F.col("CURRENCY") == F.col("CURRENCY_CODE"),
+                "inner"
+            )
+            .filter(
+                (F.col("CGL_TYPE") == "E") & (F.col("DEPOSIT_EXPENSE_FLAG") == "Y") |
+                (F.col("CGL_TYPE") == "I")  & (F.col("LOAN_INCOME_FLAG") == "Y")
+                )
+            .select(
+                F.col("BRANCH_CODE").cast("string"),
+                F.col("CURRENCY").cast("string"),
+                F.col("CGL").cast("string"),
+                F.col("closing_balance").alias("NET"),
+                F.col("FROM_CGL").cast("string"),
+                F.col("TO_CGL").cast("string")
+            )
+            
+        )
+
+        # print("===== BASE DF SCHEMA =====")
+
+        if base_df.rdd.isEmpty():
+            print("No eligible FCY rows found in base_df")
+            df_empty=spark.createDataFrame([],schema="""TRANSACTION_DATE DATE , BRANCH_CODE STRING, CURRENCY STRING, CGL STRING, NARRATION STRING, CREDIT_AMOUNT DECIMAL(25,4), DEBIT_AMOUNT DECIMAL(25,4), TRANSACTION_COUNT DECIMAL(10,0), SOURCE_FLAG STRING""")
+            return df_empty 
+        
+        
+        
+        fcy_df = (
+        base_df
+        .select(
+            F.explode(
+                F.array(
+                # Credit FROM_CGL (if AMOUNT > 0)
+                F.struct(
+                    F.col("BRANCH_CODE").alias("branch"),
+                    F.col("CURRENCY").alias("currency"),
+                    F.col("FROM_CGL").alias("cgl"),
+                    (-F.least(F.col("NET"), F.lit(0))).alias("CREDIT_AMOUNT"),  # if NET<=0
+                    (-F.greatest(F.col("NET"), F.lit(0))).alias("DEBIT_AMOUNT"), # if NET>0
+       
+                    F.lit("FCY TRANSFER").alias("narration"),
+                    
+                ),
+                # Debit TRANSFER_CGL at same branch (if AMOUNT > 0)
+                F.struct(
+                    F.col("BRANCH_CODE").alias("branch"),
+                    F.col("CURRENCY").alias("currency"),
+                    F.lit(TRANSFER_CGL).alias("cgl"),
+                    F.greatest(F.col("NET"), F.lit(0)).alias("CREDIT_AMOUNT"),  # if NET>0
+                    F.least(F.col("NET"), F.lit(0)).alias("DEBIT_AMOUNT"),    # if NET<=0
+      
+                    F.lit("FCY TRANSFER").alias("narration"),
+                    
+                ),
+                # Credit TRANSFER_CGL at TARGET_BRANCH (if AMOUNT > 0)
+                F.struct(
+                    F.lit(TARGET_BRANCH).alias("branch"),
+                    F.col("CURRENCY").alias("currency"),
+                    F.lit(TRANSFER_CGL).alias("cgl"),
+                    (-F.least(F.col("NET"), F.lit(0))).alias("CREDIT_AMOUNT"),
+                    (-F.greatest(F.col("NET"), F.lit(0))).alias("DEBIT_AMOUNT"),
+       
+                    F.lit("FCY TRANSFER").alias("narration"),
+                    
+                ),
+                # Debit TO_CGL at TARGET_BRANCH (if AMOUNT <= 0)
+                F.struct(
+                    F.lit(TARGET_BRANCH).alias("branch"),
+                    F.col("CURRENCY").alias("currency"),
+                    F.col("TO_CGL").alias("cgl"),
+                    F.greatest(F.col("NET"), F.lit(0)).alias("CREDIT_AMOUNT"),
+                    F.least(F.col("NET"), F.lit(0)).alias("DEBIT_AMOUNT"),
+                    F.lit("FCY TRANSFER").alias("narration"),
+                    
+                )
+                )
+                ).alias("r"),
+            
+            
+            # #F.col("JOURNAL_ID"),
+           
+            )
+        .select(
+            
+            #F.col("JOURNAL_ID"),
+            F.col("r.branch").alias("BRANCH_CODE"),
+            F.col("r.currency").alias("CURRENCY"),
+            F.col("r.cgl").alias("CGL"),
+            F.col("r.CREDIT_AMOUNT"),
+            F.col("r.DEBIT_AMOUNT"),
+            F.col("r.narration").alias("NARRATION"),
+            F.lit("F").alias("SOURCE_FLAG"),
+            F.lit(1).alias("TRANSACTION_COUNT"),
+            F.lit(posting_date_str).cast("date").alias("TRANSACTION_DATE")
+            
+            )
+        )
+        inr_df = (
+            fcy_df.alias("fcy")
+            .filter(F.col("NARRATION") == "FCY TRANSFER")
+            .join(
+                currency_list.alias("curr"),
+                F.col("fcy.CURRENCY") == F.col("curr.CURRENCY_CODE"),
+                "inner"
+            )
+            .select(
+                
+                #F.col("JOURNAL_ID"),
+                F.col("TRANSACTION_DATE"),
+                F.col("BRANCH_CODE"),
+                F.lit("INR").alias("CURRENCY"),
+                F.col("CGL"),
+                # (-F.col("DEBIT_AMOUNT") * F.col("CURRENCY_RATE"))
+                #     .cast(DecimalType(25,2)).alias("CREDIT_AMOUNT"),
+                # (-F.col("CREDIT_AMOUNT") * F.col("CURRENCY_RATE"))
+                #     .cast(DecimalType(25,2)).alias("DEBIT_AMOUNT"),
+                
+               F.round(
+                   -F.col("DEBIT_AMOUNT").cast("double")*F.col("CURRENCY_RATE").cast(("double")),
+                   2
+               ).cast(DecimalType(25,4)).alias("CREDIT_AMOUNT"),
+               
+               F.round(
+                   -F.col("CREDIT_AMOUNT").cast("double")*F.col("CURRENCY_RATE").cast("double"),
+                   2
+               ).cast(DecimalType(25,4)).alias("DEBIT_AMOUNT"),
+               
+                F.lit("INR VALUATION").alias("NARRATION"),
+                F.lit("F").alias("SOURCE_FLAG"),
+                F.lit(1).alias("TRANSACTION_COUNT")
+                
+                )
+            )
+        
+        # print("==========INR Output Before Aggregation=============")
+        # if debug_cgl:
+        #      print("===================Generated Four Legs===============================")
+        #      return inr_df
+       
+        
+        final_df = fcy_df.unionByName(inr_df)
+        return final_df
+    
+    except Exception as e:
+        print("ERROR IN monthend_posting")
+        raise
