@@ -1,0 +1,83 @@
+def ppf_postings(df,source_cgl="XXXXXXXXXXX",transfer_cgl="YYYYYY",destination_cgl="XXXXXXXXXXX",other_branch="BBBBB"):
+    base_df = (
+        df
+        .filter(
+            (F.col("CGL") == source_cgl) &
+            (F.col("BRANCH_CODE") != other_branch) &
+            ((F.col("CREDIT_AMOUNT") != 0) | (F.col("DEBIT_AMOUNT") != 0))& ((F.col("CREDIT_AMOUNT") + F.col("DEBIT_AMOUNT")) != 0)
+        )
+        .select(
+            "BATCH_ID",
+            "JOURNAL_ID",
+            "BRANCH_CODE",
+            "CURRENCY",
+            "CGL",
+            "NARRATION",
+            "TRANSACTION_COUNT",      
+            (F.col("CREDIT_AMOUNT") + F.col("DEBIT_AMOUNT")).alias("NET")
+        )
+    )
+    
+    
+    
+    
+    generated_df = base_df.select(
+    F.explode(F.array(
+       F.struct(
+           F.col("BATCH_ID"),
+           F.col("JOURNAL_ID"),
+           F.lit("PPF TFR TO GAD").alias("NARRATION"),
+           F.lit(1).alias("TRANSACTION_COUNT"),
+           F.col("BRANCH_CODE"),
+           F.col("CURRENCY"),
+           F.col("CGL"),
+           (-F.least(F.col("NET"), F.lit(0))).alias("CREDIT_AMOUNT"),  # if NET<=0
+           (-F.greatest(F.col("NET"), F.lit(0))).alias("DEBIT_AMOUNT")  # if NET>0
+       ),
+       F.struct(
+           F.col("BATCH_ID"),
+           F.col("JOURNAL_ID"),
+           F.lit("PPF TFR TO GAD").alias("NARRATION"),
+           F.lit(1).alias("TRANSACTION_COUNT"),
+           F.col("BRANCH_CODE"),
+           F.col("CURRENCY"),
+           F.lit(transfer_cgl).alias("CGL"),
+           F.greatest(F.col("NET"), F.lit(0)).alias("CREDIT_AMOUNT"),  # if NET>0
+           F.least(F.col("NET"), F.lit(0)).alias("DEBIT_AMOUNT")    # if NET<=0
+       ),
+       F.struct(
+           F.col("BATCH_ID"),
+           F.col("JOURNAL_ID"),
+           F.lit("PPF TFR TO GAD").alias("NARRATION"),
+           F.lit(1).alias("TRANSACTION_COUNT"),
+           F.lit(other_branch).alias("BRANCH_CODE"),
+           F.col("CURRENCY"),
+           F.lit(transfer_cgl).alias("CGL"),
+           (-F.least(F.col("NET"), F.lit(0))).alias("CREDIT_AMOUNT"),
+           (-F.greatest(F.col("NET"), F.lit(0))).alias("DEBIT_AMOUNT")
+       ),
+       F.struct(
+           F.col("BATCH_ID"),
+           F.col("JOURNAL_ID"),
+           F.lit("PPF TFR TO GAD").alias("NARRATION"),
+           F.lit(1).alias("TRANSACTION_COUNT"),
+           F.lit(other_branch).alias("BRANCH_CODE"),
+           F.col("CURRENCY"),
+           F.lit(destination_cgl).alias("CGL"),
+           F.greatest(F.col("NET"), F.lit(0)).alias("CREDIT_AMOUNT"),
+           F.least(F.col("NET"), F.lit(0)).alias("DEBIT_AMOUNT")
+       ))).alias("r")).select("r.*")
+    
+    
+    
+    
+    
+    generated_df=generated_df.groupBy("BRANCH_CODE", "CURRENCY", "CGL").agg(
+            F.sum("CREDIT_AMOUNT").alias("CREDIT_AMOUNT"),
+            F.sum("DEBIT_AMOUNT").alias("DEBIT_AMOUNT"),
+            F.lit("P").alias("SOURCE_FLAG"),
+            F.sum("TRANSACTION_COUNT").alias("TRANSACTION_COUNT"),
+            F.first("NARRATION").alias("NARRATION"),     
+            F.first("BATCH_ID").alias("BATCH_ID"),
+            F.first("JOURNAL_ID").alias("JOURNAL_ID"),
+        ).select("BRANCH_CODE", "CURRENCY", "CGL","CREDIT_AMOUNT","DEBIT_AMOUNT","BATCH_ID","JOURNAL_ID","NARRATION","TRANSACTION_COUNT","SOURCE_FLAG")
