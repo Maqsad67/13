@@ -1,0 +1,157 @@
+CREATE OR REPLACE PROCEDURE generate_ppf_transactions (
+   p_batch_id    IN NUMBER,
+   p_target_date IN DATE
+)
+AS
+   -- =====================================================
+   -- PPF constants
+   -- Change these in one place if business rules change
+   -- =====================================================
+   v_journal_prefix VARCHAR2(50);
+   v_source_flag      VARCHAR2(1)  := 'A';
+   v_narration        VARCHAR2(100) := 'PPF TFR TO GAD';
+   v_source_cgl       VARCHAR2(10) := 'XXXXXXXXXX';
+   v_transfer_cgl     VARCHAR2(10) := 'YYYYYYYYYY';
+   v_destination_cgl  VARCHAR2(10) := 'XXXXXXXXXX';
+   v_other_branch     VARCHAR2(5)  := 'BBBBB';
+BEGIN
+
+    v_journal_prefix := get_next_journal_id();
+   INSERT INTO gl_prior_adjustment_transactions
+   (
+       batch_id,
+       journal_id,
+       transaction_date,
+       branch_code,
+       currency,
+       cgl,
+       narration,
+       credit_amount,
+       debit_amount,
+       transaction_count,
+       source_flag
+   )
+   WITH ppf_base AS
+   (
+       SELECT
+           v.req_id,
+           v.batch_id,
+           v.req_branch_code AS branch_code,
+           v.req_currency    AS currency,
+           v.req_cgl         AS cgl,
+           v.req_amount,
+           CASE
+               WHEN v.req_amount < 0
+               THEN v.req_amount
+               ELSE 0
+           END AS debit_amount,
+           CASE
+               WHEN v.req_amount > 0
+               THEN v.req_amount
+               ELSE 0
+           END AS credit_amount
+       FROM voucher_posting_data v
+       WHERE v.batch_id = p_batch_id
+         AND v.req_cgl = v_source_cgl
+         AND v.req_branch_code <> v_other_branch
+   ),
+ppf_eligible AS
+(
+   SELECT
+       batch_id,
+       branch_code,
+       currency,
+       cgl,
+       SUM(credit_amount + debit_amount) AS net
+   FROM ppf_base
+   GROUP BY
+       batch_id,
+       branch_code,
+       currency,
+       cgl
+   HAVING SUM(credit_amount + debit_amount) <> 0
+),
+  ppf_transactions as (
+
+     -- =====================================================
+   -- TXN 1: Source CGL at original branch
+   -- =====================================================
+   SELECT
+       batch_id,
+       branch_code,
+       currency,
+       cgl,
+       v_narration,
+       -GREATEST(net, 0) as debit_amount,
+       -LEAST(net, 0) as credit_amount,
+       1,
+       v_source_flag
+   FROM ppf_eligible
+   UNION ALL
+   -- =====================================================
+   -- TXN 2: Transfer CGL at original branch
+   -- =====================================================
+   SELECT
+       batch_id,
+       branch_code,
+       currency,
+       v_transfer_cgl,
+       v_narration,
+       LEAST(net, 0) as debit_amount,
+       GREATEST(net, 0) as credit_amount,
+       1,
+       v_source_flag
+   FROM ppf_eligible
+   UNION ALL
+   -- =====================================================
+   -- TXN 3: Transfer CGL at other branch
+   -- =====================================================
+   SELECT
+       batch_id,
+       v_other_branch,
+       currency,
+       v_transfer_cgl,
+       v_narration,
+       -GREATEST(net, 0) as debit_amount,
+       -LEAST(net, 0) as credit_amount,
+       1,
+       v_source_flag
+   FROM ppf_eligible
+   UNION ALL
+   -- =====================================================
+   -- TXN 4: Destination CGL at other branch
+   -- =====================================================
+   SELECT
+       batch_id,
+       v_other_branch,
+       currency,
+       v_destination_cgl,
+       v_narration,
+       LEAST(net, 0) as debit_amount,
+       GREATEST(net, 0) as credit_amount,
+       1,
+       v_source_flag
+   FROM ppf_eligible
+
+  )
+
+   select batch_id,
+            v_journal_prefix || '-' || ROW_NUMBER() OVER (ORDER BY branch_code), 
+            p_target_date,
+            branch_code,
+            currency,
+            cgl,
+            'PPF TO GAD' as narration,
+            debit_amount,
+            credit_amount,
+            1,
+            'A' from ppf_transactions;
+
+
+
+
+
+EXCEPTION
+   WHEN OTHERS THEN
+       RAISE;
+END generate_ppf_transactions;
