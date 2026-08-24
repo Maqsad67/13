@@ -1,0 +1,24 @@
+SELECT currency_code,
+      currency_rate,
+      rate_change_date
+FROM (
+   SELECT c.currency_code,
+          c.currency_rate,
+          c.rate_change_date,
+          ROW_NUMBER() OVER (
+              PARTITION BY c.currency_code
+              ORDER BY c.rate_change_date DESC 
+          ) rn
+   FROM currency_rate_change c
+   WHERE c.rate_change_date >= CASE
+    WHEN EXTRACT(DAY FROM p_target_date) >= 30 
+    THEN TRUNC(ADD_MONTHS(p_target_date, 1), 'MM')
+    ELSE TRUNC(p_target_date, 'MM')
+END
+AND c.rate_change_date < CASE
+    WHEN EXTRACT(DAY FROM p_target_date) >= 30 
+    THEN TRUNC(ADD_MONTHS(p_target_date, 1), 'MM') + 1
+    ELSE p_target_date + 1 
+END   
+)
+WHERE rn = 1;   
