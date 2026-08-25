@@ -1,0 +1,125 @@
+CREATE OR REPLACE PROCEDURE populate_balance_prior_adjustment (
+   p_batch_id    IN NUMBER,
+   p_target_date IN DATE
+)
+AS
+BEGIN
+   INSERT INTO gl_balance_prior_adjustment (
+       batch_id,
+       adjustment_date,
+       branch_code,
+       currency,
+       cgl,
+       adjustment_amount,
+       adjustment_amount_inr
+   )
+   WITH all_adjustments AS (
+       /* =========================================
+          USER TRANSACTIONS
+          ========================================= */
+       SELECT
+           batch_id,
+           p_target_date AS adjustment_date,
+           req_branch_code AS branch_code,
+           req_currency AS currency,
+           req_cgl AS cgl,
+           req_amount AS adjustment_amount
+       FROM gl_voucher_posting_data
+       WHERE batch_id = p_batch_id
+       UNION ALL
+       /* =========================================
+          SYSTEM GENERATED TRANSACTIONS
+          ========================================= */
+       SELECT
+           batch_id,
+           transaction_date AS adjustment_date,
+           branch_code,
+           currency,
+           cgl,
+           debit_amount + credit_amount AS adjustment_amount
+       FROM gl_prior_adjustment_transactions
+       WHERE batch_id = p_batch_id
+   ),
+   /* =============================================
+      AGGREGATE USER + SYSTEM TRANSACTIONS
+      ============================================= */
+   aggregated AS (
+       SELECT
+           batch_id,
+           adjustment_date,
+           branch_code,
+           currency,
+           cgl,
+           SUM(adjustment_amount) AS adjustment_amount
+       FROM all_adjustments
+       GROUP BY
+           batch_id,
+           adjustment_date,
+           branch_code,
+           currency,
+           cgl
+   ),
+   /* =============================================
+      GET CURRENCY RATE
+      ============================================= */
+   rates AS (
+       SELECT
+           a.adjustment_date,
+           c.currency_code,
+           c.currency_rate,
+           ROW_NUMBER() OVER (
+               PARTITION BY
+                   a.adjustment_date,
+                   c.currency_code
+               ORDER BY c.rate_change_date DESC
+           ) rn
+       FROM (
+           SELECT DISTINCT adjustment_date
+           FROM aggregated
+           WHERE currency <> 'INR'
+       ) a
+       JOIN currency_rate_change c
+         ON c.rate_change_date >=
+            CASE
+                WHEN EXTRACT(DAY FROM a.adjustment_date) >= 30
+                THEN TRUNC(
+                       ADD_MONTHS(a.adjustment_date, 1),
+                       'MM'
+                     )
+                ELSE TRUNC(a.adjustment_date, 'MM')
+            END
+        AND c.rate_change_date <
+            CASE
+                WHEN EXTRACT(DAY FROM a.adjustment_date) >= 30
+                THEN TRUNC(
+                       ADD_MONTHS(a.adjustment_date, 1),
+                       'MM'
+                     ) + 1
+                ELSE a.adjustment_date
+            END
+   )
+   SELECT
+       a.batch_id,
+       a.adjustment_date,
+       a.branch_code,
+       a.currency,
+       a.cgl,
+       a.adjustment_amount,
+       CASE
+           WHEN a.currency = 'INR'
+           THEN a.adjustment_amount
+           ELSE
+               a.adjustment_amount * r.currency_rate
+       END AS adjustment_amount_inr
+   FROM aggregated a
+   LEFT JOIN rates r
+     ON r.adjustment_date = a.adjustment_date
+    AND r.currency_code = a.currency
+    AND r.rn = 1;
+--   
+EXCEPTION
+   WHEN OTHERS THEN
+       ROLLBACK;
+       RAISE;
+END;
+/
