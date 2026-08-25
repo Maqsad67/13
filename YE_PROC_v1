@@ -1,0 +1,689 @@
+CREATE OR REPLACE PROCEDURE PROC_PRIOR_PROFIT_TRANSFER_13B (
+    p_adjustment_date IN DATE,
+    p_batch_id        IN NUMBER
+) AS
+
+    ------------------------------------------------------------------
+    -- CONFIGURATION
+    ------------------------------------------------------------------
+
+    c_source_flag CONSTANT VARCHAR2(1) := 'A';
+
+    c_inr_currency CONSTANT VARCHAR2(3) := 'INR';
+
+    -- P&L / Circle CGL
+    c_pl_cgl CONSTANT VARCHAR2(20) := 'ABC';
+
+    -- Transfer CGL
+    c_transfer_cgl CONSTANT VARCHAR2(20) := 'XYZ';
+
+    -- Specific memo CGL used by Rule 5
+    c_memo_cgl CONSTANT VARCHAR2(20) := '5000000000';
+
+    -- Income / Expense CGLs
+    c_income_cgl_prefix CONSTANT VARCHAR2(1) := '7';
+    c_expense_cgl_prefix CONSTANT VARCHAR2(1) := '8';
+
+    -- Narration
+    c_pl_narration_prefix CONSTANT VARCHAR2(100)
+        := 'P and L Prior Adjustment for Circle ';
+
+    ------------------------------------------------------------------
+    -- JOURNAL PREFIX
+    ------------------------------------------------------------------
+
+    v_journal_prefix NUMBER;
+
+BEGIN
+
+    DBMS_OUTPUT.PUT_LINE(
+        'YEAR END PROCEDURE STARTED'
+    );
+
+    DBMS_OUTPUT.PUT_LINE(
+        'Adjustment Date : ' ||
+        TO_CHAR(p_adjustment_date, 'DD-MM-YYYY')
+    );
+
+    DBMS_OUTPUT.PUT_LINE(
+        'Batch ID        : ' || p_batch_id
+    );
+
+
+    ------------------------------------------------------------------
+    -- 1. GET YEAR-END JOURNAL PREFIX
+    ------------------------------------------------------------------
+
+    v_journal_prefix := get_next_journal_id();
+
+    DBMS_OUTPUT.PUT_LINE(
+        'Journal Prefix  : ' || v_journal_prefix
+    );
+
+
+    ------------------------------------------------------------------
+    -- ================================================================
+    -- 2. PROFIT TRANSFER
+    -- ================================================================
+    --
+    -- Source:
+    --     GL_BALANCE_PRIOR_ADJUSTMENT
+    --
+    -- Only the supplied batch is processed.
+    --
+    -- TEMP_PL_TRANSFER is the intermediary GTT.
+    ------------------------------------------------------------------
+
+    INSERT INTO TEMP_PL_TRANSFER
+    (
+        BRANCH_CODE,
+        CIRCLE_BRANCH_CODE,
+        PROFIT_LOSS,
+        TRANSFER_DATE,
+        ACTIVITY_FLAG
+    )
+    WITH base AS
+    (
+        SELECT
+            B.BRANCH_CODE,
+            B.INR_BALANCE AS BALANCE
+        FROM GL_BALANCE_PRIOR_ADJUSTMENT B
+        WHERE B.BATCH_ID = p_batch_id
+          AND B.BALANCE_DATE >= TRUNC(p_adjustment_date)
+          AND B.BALANCE_DATE <  TRUNC(p_adjustment_date) + 1
+          AND (
+                 B.CGL LIKE c_income_cgl_prefix || '%'
+              OR B.CGL LIKE c_expense_cgl_prefix || '%'
+          )
+    ),
+    base_branch AS
+    (
+        SELECT
+            A.CODE        AS BRANCH_CODE,
+            B.BRANCH_CODE AS CIRCLE_CODE
+        FROM BRANCH_MASTER A
+        LEFT JOIN CIRCLE_MASTER B
+            ON A.CIRCLE_CODE = B.CIRCLE_CODE
+    )
+    SELECT
+        B.BRANCH_CODE,
+        BB.CIRCLE_CODE,
+        SUM(B.BALANCE),
+        p_adjustment_date,
+        c_source_flag
+    FROM base B
+    LEFT JOIN base_branch BB
+        ON B.BRANCH_CODE = BB.BRANCH_CODE
+    GROUP BY
+        B.BRANCH_CODE,
+        BB.CIRCLE_CODE;
+
+
+    DBMS_OUTPUT.PUT_LINE(
+        'TEMP_PL_TRANSFER Rows : ' || SQL%ROWCOUNT
+    );
+
+
+    ------------------------------------------------------------------
+    -- ================================================================
+    -- 3. GENERATE PROFIT TRANSFER TRANSACTIONS
+    -- ================================================================
+    --
+    -- Four legs are generated.
+    --
+    -- Journal prefix is common.
+    -- Each leg gets a unique suffix.
+    ------------------------------------------------------------------
+
+    INSERT INTO TEMP_PL_TRANSFER_TRANSACTIONS
+    (
+        CIRCLE_CODE,
+        BATCH_ID,
+        JOURNAL_ID,
+        TRANSACTION_COUNT,
+        BRANCH_CODE,
+        CURRENCY,
+        CGL,
+        DEBIT_AMOUNT,
+        CREDIT_AMOUNT,
+        TRANSACTION_DATE,
+        SOURCE_FLAG,
+        NARRATION
+    )
+    WITH generated_legs AS
+    (
+        ------------------------------------------------------------------
+        -- LEG 1
+        ------------------------------------------------------------------
+
+        SELECT
+            T.CIRCLE_BRANCH_CODE AS CIRCLE_CODE,
+            T.BRANCH_CODE,
+            c_inr_currency AS CURRENCY,
+            c_pl_cgl AS CGL,
+
+            CASE
+                WHEN T.PROFIT_LOSS > 0
+                THEN -T.PROFIT_LOSS
+                ELSE 0
+            END AS DEBIT_AMOUNT,
+
+            CASE
+                WHEN T.PROFIT_LOSS <= 0
+                THEN ABS(T.PROFIT_LOSS)
+                ELSE 0
+            END AS CREDIT_AMOUNT,
+
+            1 AS LEG_NO,
+
+            T.TRANSFER_DATE,
+            c_source_flag AS SOURCE_FLAG,
+            c_pl_narration_prefix ||
+                T.CIRCLE_BRANCH_CODE AS NARRATION
+
+        FROM TEMP_PL_TRANSFER T
+        WHERE T.ACTIVITY_FLAG = c_source_flag
+
+
+        UNION ALL
+
+
+        ------------------------------------------------------------------
+        -- LEG 2
+        ------------------------------------------------------------------
+
+        SELECT
+            T.CIRCLE_BRANCH_CODE,
+            T.BRANCH_CODE,
+            c_inr_currency,
+            c_transfer_cgl,
+
+            CASE
+                WHEN T.PROFIT_LOSS <= 0
+                THEN T.PROFIT_LOSS
+                ELSE 0
+            END,
+
+            CASE
+                WHEN T.PROFIT_LOSS > 0
+                THEN T.PROFIT_LOSS
+                ELSE 0
+            END,
+
+            2,
+
+            T.TRANSFER_DATE,
+            c_source_flag,
+            c_pl_narration_prefix ||
+                T.CIRCLE_BRANCH_CODE
+
+        FROM TEMP_PL_TRANSFER T
+        WHERE T.ACTIVITY_FLAG = c_source_flag
+
+
+        UNION ALL
+
+
+        ------------------------------------------------------------------
+        -- LEG 3
+        ------------------------------------------------------------------
+
+        SELECT
+            T.CIRCLE_BRANCH_CODE,
+            T.CIRCLE_BRANCH_CODE,
+            c_inr_currency,
+            c_transfer_cgl,
+
+            CASE
+                WHEN T.PROFIT_LOSS > 0
+                THEN -T.PROFIT_LOSS
+                ELSE 0
+            END,
+
+            CASE
+                WHEN T.PROFIT_LOSS <= 0
+                THEN ABS(T.PROFIT_LOSS)
+                ELSE 0
+            END,
+
+            3,
+
+            T.TRANSFER_DATE,
+            c_source_flag,
+            c_pl_narration_prefix ||
+                T.CIRCLE_BRANCH_CODE
+
+        FROM TEMP_PL_TRANSFER T
+        WHERE T.ACTIVITY_FLAG = c_source_flag
+
+
+        UNION ALL
+
+
+        ------------------------------------------------------------------
+        -- LEG 4
+        ------------------------------------------------------------------
+
+        SELECT
+            T.CIRCLE_BRANCH_CODE,
+            T.CIRCLE_BRANCH_CODE,
+            c_inr_currency,
+            c_pl_cgl,
+
+            CASE
+                WHEN T.PROFIT_LOSS <= 0
+                THEN T.PROFIT_LOSS
+                ELSE 0
+            END,
+
+            CASE
+                WHEN T.PROFIT_LOSS > 0
+                THEN T.PROFIT_LOSS
+                ELSE 0
+            END,
+
+            4,
+
+            T.TRANSFER_DATE,
+            c_source_flag,
+            c_pl_narration_prefix ||
+                T.CIRCLE_BRANCH_CODE
+
+        FROM TEMP_PL_TRANSFER T
+        WHERE T.ACTIVITY_FLAG = c_source_flag
+    ),
+    numbered_legs AS
+    (
+        SELECT
+            G.*,
+
+            v_journal_prefix || '-' ||
+            ROW_NUMBER() OVER
+            (
+                ORDER BY
+                    CIRCLE_CODE,
+                    BRANCH_CODE,
+                    LEG_NO
+            ) AS JOURNAL_ID
+
+        FROM generated_legs G
+    )
+    SELECT
+        CIRCLE_CODE,
+        p_batch_id,
+        JOURNAL_ID,
+        1,
+        BRANCH_CODE,
+        CURRENCY,
+        CGL,
+        DEBIT_AMOUNT,
+        CREDIT_AMOUNT,
+        TRANSFER_DATE,
+        SOURCE_FLAG,
+        NARRATION
+    FROM numbered_legs;
+
+
+    DBMS_OUTPUT.PUT_LINE(
+        'TEMP_PL_TRANSFER_TRANSACTIONS Rows : ' ||
+        SQL%ROWCOUNT
+    );
+
+
+    ------------------------------------------------------------------
+    -- ================================================================
+    -- 4. PERSIST SYSTEM TRANSACTIONS
+    -- ================================================================
+    --
+    -- TEMP_PL_TRANSFER_TRANSACTIONS is the intermediary GTT.
+    --
+    -- No persistent P_L_TRANSFER_TRANSACTIONS table is required.
+    ------------------------------------------------------------------
+
+    INSERT INTO GL_PRIOR_ADJUSTMENT_TRANSACTIONS
+    (
+        CIRCLE_CODE,
+        BATCH_ID,
+        TRANSACTION_COUNT,
+        BRANCH_CODE,
+        CURRENCY,
+        CGL,
+        DEBIT_AMOUNT,
+        CREDIT_AMOUNT,
+        TRANSACTION_DATE,
+        SOURCE_FLAG,
+        JOURNAL_ID,
+        NARRATION
+    )
+    SELECT
+        CIRCLE_CODE,
+        BATCH_ID,
+        TRANSACTION_COUNT,
+        BRANCH_CODE,
+        CURRENCY,
+        CGL,
+        DEBIT_AMOUNT,
+        CREDIT_AMOUNT,
+        TRANSACTION_DATE,
+        SOURCE_FLAG,
+        JOURNAL_ID,
+        NARRATION
+    FROM TEMP_PL_TRANSFER_TRANSACTIONS;
+
+
+    DBMS_OUTPUT.PUT_LINE(
+        'GL_PRIOR_ADJUSTMENT_TRANSACTIONS Rows : ' ||
+        SQL%ROWCOUNT
+    );
+
+
+    ------------------------------------------------------------------
+    -- ================================================================
+    -- 5. PROFIT POSTING
+    -- ================================================================
+    --
+    -- Aggregate directly from the transaction GTT.
+    --
+    -- No P_L_TRANSFER_BALANCE table.
+    ------------------------------------------------------------------
+
+    MERGE INTO GL_BALANCE_PRIOR_ADJUSTMENT TARGET
+    USING
+    (
+        SELECT
+            BRANCH_CODE,
+            CURRENCY,
+            CGL,
+            SUM(CREDIT_AMOUNT + DEBIT_AMOUNT) AS BALANCE
+        FROM TEMP_PL_TRANSFER_TRANSACTIONS
+        GROUP BY
+            BRANCH_CODE,
+            CURRENCY,
+            CGL
+    ) SOURCE
+    ON
+    (
+           TARGET.BATCH_ID = p_batch_id
+       AND TARGET.BRANCH_CODE = SOURCE.BRANCH_CODE
+       AND TARGET.CURRENCY = SOURCE.CURRENCY
+       AND TARGET.CGL = SOURCE.CGL
+       AND TARGET.BALANCE_DATE >= TRUNC(p_adjustment_date)
+       AND TARGET.BALANCE_DATE <  TRUNC(p_adjustment_date) + 1
+    )
+    WHEN MATCHED THEN
+        UPDATE SET
+            TARGET.BALANCE =
+                NVL(TARGET.BALANCE, 0) + SOURCE.BALANCE,
+
+            TARGET.INR_BALANCE =
+                NVL(TARGET.INR_BALANCE, 0) + SOURCE.BALANCE
+
+    WHEN NOT MATCHED THEN
+        INSERT
+        (
+            BATCH_ID,
+            BRANCH_CODE,
+            CGL,
+            CURRENCY,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        )
+        VALUES
+        (
+            p_batch_id,
+            SOURCE.BRANCH_CODE,
+            SOURCE.CGL,
+            SOURCE.CURRENCY,
+            p_adjustment_date,
+            SOURCE.BALANCE,
+            SOURCE.BALANCE
+        );
+
+
+    DBMS_OUTPUT.PUT_LINE(
+        'Profit Posting MERGE Rows : ' || SQL%ROWCOUNT
+    );
+
+
+    ------------------------------------------------------------------
+    -- ================================================================
+    -- 6. ETL + 1
+    -- ================================================================
+    --
+    -- IMPORTANT:
+    --
+    -- We deliberately read GL_BALANCE_PRIOR_ADJUSTMENT again.
+    --
+    -- The March-31 balances have changed during Profit Posting.
+    --
+    -- Rule 5 is also based on GL_BALANCE_PRIOR_ADJUSTMENT.
+    --
+    -- The result is inserted as April-1 staging records.
+    ------------------------------------------------------------------
+
+    INSERT INTO GL_BALANCE_PRIOR_ADJUSTMENT
+    (
+        BATCH_ID,
+        BRANCH_CODE,
+        CGL,
+        CURRENCY,
+        BALANCE_DATE,
+        BALANCE,
+        INR_BALANCE
+    )
+    WITH base_data AS
+    (
+        SELECT
+            B.CGL,
+            B.CURRENCY,
+            B.BRANCH_CODE,
+            B.BALANCE,
+            B.INR_BALANCE,
+            B.BALANCE_DATE,
+            C.BAL_FWD
+        FROM GL_BALANCE_PRIOR_ADJUSTMENT B
+        LEFT JOIN CGL_MASTER C
+            ON TRIM(B.CGL) = TRIM(C.CGL_NUMBER)
+        WHERE B.BATCH_ID = p_batch_id
+          AND B.BALANCE_DATE >= TRUNC(p_adjustment_date)
+          AND B.BALANCE_DATE <  TRUNC(p_adjustment_date) + 1
+    ),
+
+    ------------------------------------------------------------------
+    -- INCOME / EXPENSE
+    ------------------------------------------------------------------
+
+    rule_78 AS
+    (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM base_data
+        WHERE (
+                 CGL LIKE c_income_cgl_prefix || '%'
+              OR CGL LIKE c_expense_cgl_prefix || '%'
+              )
+          AND TRIM(CURRENCY) <> c_inr_currency
+
+        UNION ALL
+
+        SELECT
+            CGL,
+            c_inr_currency,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            -INR_BALANCE,
+            -INR_BALANCE
+        FROM base_data
+        WHERE (
+                 CGL LIKE c_income_cgl_prefix || '%'
+              OR CGL LIKE c_expense_cgl_prefix || '%'
+              )
+          AND TRIM(CURRENCY) <> c_inr_currency
+    ),
+
+    ------------------------------------------------------------------
+    -- CIRCLE CGL
+    ------------------------------------------------------------------
+
+    rule_circle AS
+    (
+        SELECT
+            B.CGL,
+            B.CURRENCY,
+            B.BRANCH_CODE,
+            B.BALANCE_DATE,
+            B.BALANCE,
+            B.INR_BALANCE
+        FROM base_data B
+        INNER JOIN
+        (
+            SELECT DISTINCT
+                BRANCH_CODE
+            FROM CIRCLE_MASTER
+            WHERE BRANCH_CODE IS NOT NULL
+        ) C
+            ON B.BRANCH_CODE = C.BRANCH_CODE
+        WHERE B.BAL_FWD = 1
+          AND B.CGL = c_pl_cgl
+    ),
+
+    ------------------------------------------------------------------
+    -- GENERAL
+    --
+    -- Deliberately does NOT exclude c_memo_cgl.
+    -- This preserves the original rule.
+    ------------------------------------------------------------------
+
+    rule_general AS
+    (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM base_data
+        WHERE BAL_FWD = 1
+          AND NOT
+              (
+                   CGL LIKE c_income_cgl_prefix || '%'
+                OR CGL LIKE c_expense_cgl_prefix || '%'
+              )
+          AND CGL <> c_pl_cgl
+    ),
+
+    ------------------------------------------------------------------
+    -- RULE 5 / MEMO CGL
+    --
+    -- Exact CGL match.
+    ------------------------------------------------------------------
+
+    rule_5 AS
+    (
+        SELECT
+            c_memo_cgl AS CGL,
+            B.CURRENCY,
+            B.BRANCH_CODE,
+            p_adjustment_date AS BALANCE_DATE,
+            -SUM(B.BALANCE) AS BALANCE,
+            -SUM(B.INR_BALANCE) AS INR_BALANCE
+        FROM GL_BALANCE_PRIOR_ADJUSTMENT B
+        WHERE B.BATCH_ID = p_batch_id
+          AND B.BALANCE_DATE >= TRUNC(p_adjustment_date)
+          AND B.BALANCE_DATE <  TRUNC(p_adjustment_date) + 1
+          AND B.CGL = c_memo_cgl
+          AND EXISTS
+          (
+              SELECT 1
+              FROM CGL_MASTER C
+              WHERE TRIM(C.CGL_NUMBER) = TRIM(B.CGL)
+                AND C.BAL_FWD = 1
+          )
+        GROUP BY
+            B.BRANCH_CODE,
+            B.CURRENCY
+    ),
+
+    ------------------------------------------------------------------
+    -- CIRCLE PROFIT
+    --
+    -- Reuse TEMP_PL_TRANSFER rather than reading a persistent
+    -- P_L_TRANSFER table.
+    ------------------------------------------------------------------
+
+    circle_profit AS
+    (
+        SELECT
+            c_pl_cgl AS CGL,
+            c_inr_currency AS CURRENCY,
+            BRANCH_CODE,
+            p_adjustment_date AS BALANCE_DATE,
+            PROFIT_LOSS AS BALANCE,
+            PROFIT_LOSS AS INR_BALANCE
+        FROM TEMP_PL_TRANSFER
+        WHERE BRANCH_CODE = CIRCLE_BRANCH_CODE
+          AND ACTIVITY_FLAG = c_source_flag
+    ),
+
+    opening_balance AS
+    (
+        SELECT * FROM rule_78
+
+        UNION ALL
+
+        SELECT * FROM rule_circle
+
+        UNION ALL
+
+        SELECT * FROM rule_general
+
+        UNION ALL
+
+        SELECT * FROM rule_5
+
+        UNION ALL
+
+        SELECT * FROM circle_profit
+    )
+
+    SELECT
+        p_batch_id,
+        BRANCH_CODE,
+        CGL,
+        CURRENCY,
+        TRUNC(p_adjustment_date) + 1,
+        SUM(BALANCE),
+        SUM(INR_BALANCE)
+    FROM opening_balance
+    GROUP BY
+        BRANCH_CODE,
+        CGL,
+        CURRENCY;
+
+
+    DBMS_OUTPUT.PUT_LINE(
+        'ETL + 1 Rows : ' || SQL%ROWCOUNT
+    );
+
+
+    ------------------------------------------------------------------
+    -- NO COMMIT
+    --
+    -- Parent procedure owns COMMIT.
+    --
+    -- GTTs are cleared by the parent's COMMIT.
+    ------------------------------------------------------------------
+
+    DBMS_OUTPUT.PUT_LINE(
+        'YEAR END PROCEDURE COMPLETED SUCCESSFULLY'
+    );
+
+END PROC_PRIOR_PROFIT_TRANSFER_13B;
+/
