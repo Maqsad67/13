@@ -1,0 +1,96 @@
+CREATE OR REPLACE PROCEDURE PROC_POPULATE_ADJUSTMENT_TABLE (
+   p_adjustment_date IN DATE,
+   p_batch_id        IN NUMBER
+) AS
+   ------------------------------------------------------------------
+   -- CONFIGURATION
+   ------------------------------------------------------------------
+   v_year_end_date DATE;
+BEGIN
+   DBMS_OUTPUT.PUT_LINE(
+       'Parent procedure started. Batch ID: ' || p_batch_id
+   );
+   ------------------------------------------------------------------
+   -- 1. GET ACTIVE YEAR-END DATE
+   ------------------------------------------------------------------
+   SELECT year_end_date
+   INTO   v_year_end_date
+   FROM   calendar_config
+   WHERE  active_flag = 1;
+   DBMS_OUTPUT.PUT_LINE(
+       'Configured year-end date: ' ||
+       TO_CHAR(v_year_end_date, 'DD-MM-YYYY')
+   );
+   ------------------------------------------------------------------
+   -- 2. GENERATE FCNB
+   ------------------------------------------------------------------
+   -- FCNB generation
+   --
+   -- Must use p_batch_id
+   -- Must generate its own transaction/journal data
+   --
+   -- PROC_FCNB(
+   --     p_adjustment_date => p_adjustment_date,
+   --     p_batch_id        => p_batch_id
+   -- );
+   PROC_CREATE_FCNB_TRANSACTIONS(p_batch_id,p_adjustment_date)
+   ------------------------------------------------------------------
+   -- 3. GENERATE PPF
+   ------------------------------------------------------------------
+   -- PPF generation
+   --
+   -- Must use p_batch_id
+   --
+   -- PROC_PPF(
+   --     p_adjustment_date => p_adjustment_date,
+   --     p_batch_id        => p_batch_id
+   -- );
+    PROC_GENERATE_PPF_TRANSACTIONS(p_batch_id,p_adjustment_date)
+   ------------------------------------------------------------------
+   -- 4. POPULATE STAGING BALANCES
+   ------------------------------------------------------------------
+   --
+   -- At this point:
+   --
+   --   User transactions
+   --   + FCNB transactions
+   --   + PPF transactions
+   --   + currency processing
+   --
+   -- are used to populate/update
+   --
+   -- GL_BALANCE_PRIOR_ADJUSTMENT
+   --
+   -- All reads must be restricted to p_batch_id.
+   --
+
+   ------------------------------------------------------------------
+   -- 5. YEAR-END PROCESSING
+   ------------------------------------------------------------------
+   IF TRUNC(p_adjustment_date) = TRUNC(v_year_end_date) THEN
+       DBMS_OUTPUT.PUT_LINE(
+           'Year-end date matched. Starting year-end activity.'
+       );
+       PROC_YEAR_END_PROFIT_TRANSFER(
+           p_adjustment_date => p_adjustment_date,
+           p_batch_id        => p_batch_id
+       );
+   END IF;
+
+   ------------------------------------------------------------------
+   -- 6. SINGLE COMMIT
+   ------------------------------------------------------------------
+   COMMIT;
+   DBMS_OUTPUT.PUT_LINE(
+       'Parent procedure completed successfully.'
+   );
+
+EXCEPTION
+   WHEN OTHERS THEN
+       ROLLBACK;
+       DBMS_OUTPUT.PUT_LINE(
+           'Parent procedure failed: ' || SQLERRM
+       );
+       RAISE;
+END PROC_PRIOR_ADJUSTMENT;
+/
