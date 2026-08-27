@@ -1,0 +1,547 @@
+-- P_L_TRANSFER
+
+--  Code:
+-- Count: 51952
+-- Sum: 0
+--  Prod :
+-- Count: 51952
+-- Sum: 0
+
+
+WITH base AS (
+    SELECT
+        branch_code,
+        'INR'       AS currency,
+        cgl,
+        inr_balance AS balance,
+        balance_date
+    FROM
+        gl_balance
+    WHERE
+            balance_date = TO_DATE('31-MAR-26', 'DD-MON-RR')
+        AND ( cgl LIKE '7%'
+              OR cgl LIKE '8%' )
+), base_circle AS (
+    SELECT
+        a.code        AS branch_code,
+        b.branch_code AS circle_code
+    FROM
+        branch_master a
+        LEFT OUTER JOIN circle_master b ON a.circle_code = b.circle_code
+    WHERE
+        NOT EXISTS (
+            SELECT
+                1
+            FROM
+                circle_master b2
+            WHERE
+                a.code = b2.branch_code
+        )
+), df_without_circle AS (
+    SELECT
+        b.branch_code,
+        bc.circle_code,
+        SUM(b.balance) AS balance
+    FROM
+        base        b
+        LEFT JOIN base_circle bc ON b.branch_code = bc.branch_code
+    WHERE
+        bc.circle_code IS NOT NULL
+    GROUP BY
+        b.branch_code,
+        bc.circle_code
+),
+
+ p_l_transactions_raw AS (
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        branch_code,
+        'INR'        AS currency,
+        '2110505001' AS cgl,
+        CASE
+            WHEN balance <= 0 THEN
+                abs(balance)
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance > 0 THEN
+                - balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        branch_code,
+        'INR'        AS currency,
+        '1106505001' AS cgl,
+        CASE
+            WHEN balance > 0 THEN
+                balance
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance <= 0 THEN
+                balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        circle_code  AS branch_code,
+        'INR'        AS currency,
+        '1106505001' AS cgl,
+        CASE
+            WHEN balance <= 0 THEN
+                abs(balance)
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance > 0 THEN
+                - balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        circle_code  AS branch_code,
+        'INR'        AS currency,
+        '2110505001' AS cgl,
+        CASE
+            WHEN balance > 0 THEN
+                balance
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance <= 0 THEN
+                balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+), p_l_transactions AS (
+    SELECT
+        circle_code,
+        batch_id,
+        transaction_count,
+        branch_code,
+        currency,
+        cgl,
+        debit_amount,
+        credit_amount,
+        '31-03-25'                                            AS transaction_date,
+        'A'                                                   AS source_flag,
+        456                                                   AS journal_id,
+        'P and L Prior Adjustment for Circle ' || circle_code AS narration
+    FROM
+        p_l_transactions_raw
+),
+p_l_balance as (select branch_code,currency,cgl,sum(credit_amount + debit_amount) as BALANCE , sum(credit_amount + debit_amount) as INR_BALANCE, '31-MAR-26' as BALANCE_DATE from p_l_transactions group by branch_code,cgl,currency )
+select * from p_l_balance;
+
+-- P_L_TRANSFER
+
+--  Code:
+-- Count: 25978
+-- Sum: 1268056802549.06
+--  Prod :
+-- Count: 25978
+-- Sum: 1268056802549.06
+
+
+
+
+
+  WITH base AS (
+        SELECT BRANCH_CODE, CURRENCY, CGL, INR_BALANCE as BALANCE, BALANCE_DATE
+        FROM GL_BALANCE
+        WHERE BALANCE_DATE = TO_DATE('31-MAR-26', 'DD-MON-RR')
+          AND (CGL LIKE '7%' OR CGL LIKE '8%')
+    ),
+    base_branch AS (
+        SELECT A.CODE AS BRANCH_CODE, B.BRANCH_CODE AS CIRCLE_CODE
+        FROM BRANCH_MASTER A
+        LEFT OUTER JOIN CIRCLE_MASTER B ON A.CIRCLE_CODE = B.CIRCLE_CODE
+    ),
+    df_with_all_pl AS (
+        SELECT 
+            b.BRANCH_CODE,
+            bb.CIRCLE_CODE AS CIRCLE_BRANCH_CODE,
+            SUM(b.BALANCE) AS PROFIT_LOSS,
+            TO_DATE('05-MAR-26', 'DD-MON-RR') AS TRANSFER_DATE
+        FROM base b
+        LEFT JOIN base_branch bb ON b.BRANCH_CODE = bb.BRANCH_CODE
+        GROUP BY b.BRANCH_CODE, bb.CIRCLE_CODE
+    )
+    SELECT * FROM df_with_all_pl order by BRANCH_CODE,CIRCLE_BRANCH_CODE ;  
+
+
+
+--  Code
+--  Count: 103812
+-- Sum : -13912144643140.56
+
+-- Prod
+-- Count: 103812  (select count(*) from P_L_TRANSFER_TRANSACTIONS;)
+-- Sum : -13912144643140.56 (select sum(debit_amount-credit_amount) from P_L_TRANSFER_TRANSACTIONS;)
+
+WITH base AS (
+    SELECT
+        branch_code,
+        'INR'       AS currency,
+        cgl,
+        inr_balance AS balance,
+        balance_date
+    FROM
+        gl_balance
+    WHERE
+            balance_date = TO_DATE('31-MAR-26', 'DD-MON-RR')
+        AND ( cgl LIKE '7%'
+              OR cgl LIKE '8%' )
+), base_circle AS (
+    SELECT                
+        a.code        AS branch_code,
+        b.branch_code AS circle_code
+    FROM
+        branch_master a
+        LEFT OUTER JOIN circle_master b ON a.circle_code = b.circle_code
+    WHERE
+        NOT EXISTS (
+            SELECT
+                1
+            FROM
+                circle_master b2
+            WHERE
+                a.code = b2.branch_code
+        )
+), df_without_circle AS (
+    SELECT
+        b.branch_code,
+        bc.circle_code,
+        SUM(b.balance) AS balance
+    FROM
+        base        b
+        LEFT JOIN base_circle bc ON b.branch_code = bc.branch_code
+    WHERE
+        bc.circle_code IS NOT NULL
+    GROUP BY
+        b.branch_code,
+        bc.circle_code
+),
+ p_l_transactions_raw AS (
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        branch_code,
+        'INR'        AS currency,
+        '2110505001' AS cgl,
+        CASE
+            WHEN balance <= 0 THEN
+                abs(balance)
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance > 0 THEN
+                - balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        branch_code,
+        'INR'        AS currency,
+        '1106505001' AS cgl,
+        CASE
+            WHEN balance > 0 THEN
+                balance
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance <= 0 THEN
+                balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        circle_code  AS branch_code,
+        'INR'        AS currency,
+        '1106505001' AS cgl,
+        CASE
+            WHEN balance <= 0 THEN
+                abs(balance)
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance > 0 THEN
+                - balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+    UNION ALL
+    SELECT
+        circle_code,
+        123          AS batch_id,
+        1            AS transaction_count,
+        circle_code  AS branch_code,
+        'INR'        AS currency,
+        '2110505001' AS cgl,
+        CASE
+            WHEN balance > 0 THEN
+                balance
+            ELSE
+                0
+        END          AS credit_amount,
+        CASE
+            WHEN balance <= 0 THEN
+                balance
+            ELSE
+                0
+        END          AS debit_amount
+    FROM
+        df_without_circle
+), p_l_transactions AS (
+    SELECT
+        circle_code,
+        batch_id,
+        transaction_count,
+        branch_code,
+        currency,
+        cgl,
+        debit_amount,
+        credit_amount,
+        '31-03-25'                                            AS transaction_date,
+        'A'                                                   AS source_flag,
+        456                                                   AS journal_id,
+        'P and L Prior Adjustment for Circle ' || circle_code AS narration
+    FROM
+        p_l_transactions_raw
+)
+
+SELECT
+    *
+FROM
+    p_l_transactions;
+
+
+    INSERT into GL_BALANCE_PRIOR_ADJUSTMENT (batch_id,branch_code,cgl,currency,balance_date,balance,inr_balance)
+
+WITH
+    base_data AS (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE,
+            INR_BALANCE,
+            '01-APR-26' AS BALANCE_DATE
+        FROM
+            GL_BALANCE_PRIOR_ADJUSTMENT
+        WHERE
+            TRUNC (BALANCE_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+    ),
+    fwd_base AS (
+        SELECT
+            B.CGL,
+            B.CURRENCY,
+            B.BRANCH_CODE,
+            B.BALANCE,
+            B.INR_BALANCE,
+            B.BALANCE_DATE
+        FROM
+            base_data B
+            INNER JOIN CGL_MASTER C ON TRIM(B.CGL) = TRIM(C.CGL_NUMBER)
+        WHERE
+            C.BAL_FWD = 1
+    ),
+    rule_78 AS (
+        -- ——————————————————————
+        -- – ORIGINAL FOREIGN CURRENCY ROWS
+        -- ——————————————————————
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM
+            base_data
+        WHERE
+            REGEXP_LIKE (CGL, '^[78]')
+            AND TRIM(CURRENCY) <> 'INR'
+        UNION ALL
+        ------------------------------------------------------------------
+        -- OFFSET INR ROWS
+        ------------------------------------------------------------------
+        SELECT
+            CGL,
+            'INR' AS CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            - INR_BALANCE AS BALANCE,
+            - INR_BALANCE AS INR_BALANCE
+        FROM
+            base_data
+        WHERE
+            REGEXP_LIKE (CGL, '^[78]')
+            AND TRIM(CURRENCY) <> 'INR'
+    ),
+    rule_circle AS (
+        SELECT
+            F.CGL,
+            F.CURRENCY,
+            F.BRANCH_CODE,
+            F.BALANCE_DATE,
+            F.BALANCE,
+            F.INR_BALANCE
+        FROM
+            fwd_base F
+            INNER JOIN (
+                SELECT DISTINCT
+                    BRANCH_CODE
+                FROM
+                    CIRCLE_MASTER
+                WHERE
+                    BRANCH_CODE IS NOT NULL
+            ) C ON F.BRANCH_CODE = C.BRANCH_CODE
+        WHERE
+            F.CGL = '2110505001'
+    ),
+    rule_general AS (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM
+            fwd_base
+        WHERE
+            NOT REGEXP_LIKE (CGL, '^[78]')
+            AND CGL <> '2110505001'
+    ),
+    rule_5 AS (
+        SELECT
+            '5000000000' AS CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            '01-APR-26' AS BALANCE_DATE,
+            - SUM(BALANCE) AS BALANCE,
+            - SUM(INR_BALANCE) AS INR_BALANCE
+        FROM
+            GL_BAL B
+        WHERE
+            TRUNC (B.BALANCE_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+            AND B.CGL LIKE '5%'
+            AND EXISTS (
+                SELECT
+                    1
+                FROM
+                    CGL_MASTER C
+                WHERE
+                    TRIM(C.CGL_NUMBER) = TRIM(B.CGL)
+                    AND C.BAL_FWD = 1
+            )
+        GROUP BY
+            BRANCH_CODE,
+            CURRENCY
+    ),
+    circle_profit AS (
+        SELECT
+            '2110505001' AS CGL,
+            'INR' AS CURRENCY,
+            BRANCH_CODE,
+            '01-APR-26' AS BALANCE_DATE,
+            PROFIT_LOSS AS BALANCE,
+            PROFIT_LOSS AS INR_BALANCE
+        FROM
+            P_L_TRANSFER
+        WHERE
+            BRANCH_CODE = CIRCLE_BRANCH_CODE
+            AND ACTIVITY_FLAG = 'A'
+            AND TRUNC (TRANSFER_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+    ),
+    opening_balance AS (
+        SELECT
+            *
+        FROM
+            rule_78
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_circle
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_general
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_5
+        UNION ALL
+        SELECT
+            *
+        FROM
+            circle_profit
+    )
+SELECT
+    v_batch_id,
+    BRANCH_CODE,
+    CGL,
+    CURRENCY,
+    '01-APR-26' AS BALANCE_DATE,
+    SUM(BALANCE) AS BALANCE,
+    SUM(INR_BALANCE) AS INR_BALANCE
+FROM
+    opening_balance
+GROUP BY
+    CGL,
+    CURRENCY,
+    BRANCH_CODE
+ORDER BY
+    CGL,
+    CURRENCY,
+    BRANCH_CODE;
+
