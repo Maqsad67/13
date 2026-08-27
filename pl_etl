@@ -1,0 +1,102 @@
+       logger.info("=== Active financial year found ===")
+        log_etl(spark, process_run_id, "year_end_rule", 1, "Active financial year found")
+        log_etl(spark, process_run_id, "creating_opening_bal", 1, "Creating opening balance")
+
+        # Base Data: Setting the new date
+        base_df = closing_balance_df.withColumn("BALANCE_DATE", lit(etl_plus_1_str).cast("date"))
+        #base_df.show(20,False)
+        base_df.cache()
+        # 1. Load Masters for Filtering
+        cgl_master_df = read_oracle(spark, "(SELECT CGL_NUMBER FROM CGL_MASTER WHERE BAL_FWD = 1) T1")
+        circle_master_df = read_oracle(spark, "(SELECT DISTINCT BRANCH_CODE FROM CIRCLE_MASTER WHERE BRANCH_CODE IS NOT NULL) T1")
+
+        # 2. Only keeping CGLs where BAL_FWD = 1
+        # Doing this first to ensure no other logic runs on excluded CGLs
+        fwd_base_df = base_df.join(F.broadcast(cgl_master_df), 
+                                    F.trim(F.col("CGL")) == F.trim(F.col("CGL_NUMBER")), 
+                                    "inner").select("CGL","CURRENCY","BRANCH_CODE","BALANCE","INR_BALANCE","BALANCE_DATE")  
+        #fwd_base_df.show(20,False)   
+        
+        # ---  CGL 7 & 8 RULE ---
+        rule_78_base = base_df.filter(F.col("CGL").rlike("^[78]"))
+        original_78 = rule_78_base.filter(F.trim(F.col("CURRENCY")) != "INR").distinct()
+
+        # Creating the INR Offset rows
+        offset_78 = original_78.withColumn("CURRENCY", F.lit("INR")) \
+                                .withColumn("BALANCE", F.negate(F.col("INR_BALANCE"))) \
+                                .withColumn("INR_BALANCE", F.negate(F.col("INR_BALANCE")))
+
+        # Union (1 Foreign + 1 INR = 2 rows)
+        df_78_final = original_78.unionByName(offset_78)
+        #df_78_final.show(20,False)
+        # --- CGL 2110505001 rule (Circle Branches) ---
+        # Now automatically respects BAL_FWD=1 because it uses fwd_base_df
+        df_circle_final = fwd_base_df.filter(F.col("CGL") == "2110505001") \
+                                        .join(F.broadcast(circle_master_df), "BRANCH_CODE", "inner")
+        
+        # --- General rule ---
+        # Excluding the 7/8 and Circle CGLs
+        df_general_final = fwd_base_df.filter(
+            (~(F.col("CGL").cast("string").rlike("^[78]"))) & 
+            (F.col("CGL").cast("string") != "2110505001")
+        )
+        
+        # ==========================================================
+        # CGL 5xxxx aggregation
+        # ==========================================================
+        df_5_base = read_oracle(spark, f"""(SELECT * FROM {BALANCE} WHERE BALANCE_DATE = TO_DATE('{posting_date_str}', 'YYYY-MM-DD') 
+                                and cgl like '5%' and cgl in (select cgl_number from cgl_master where bal_fwd='1')) T1""")
+        print(f"MEMO RAW DATAFRAME =====================================")
+        #df_5_base.show(20,False)
+
+        df_5_final = df_5_base.groupBy("BRANCH_CODE", "CURRENCY" ) \
+            .agg(
+                F.sum("BALANCE").alias("BALANCE"),
+                F.sum("INR_BALANCE").alias("INR_BALANCE")
+            ) \
+            .withColumn("CGL", F.lit("5000000000")) \
+            .withColumn("BALANCE", F.negate(F.col("BALANCE"))) \
+            .withColumn("INR_BALANCE", F.negate(F.col("INR_BALANCE"))) \
+            .withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date"))
+        #df_5_final.show(20,False)
+        print(f"-----------------> Count of MEMO A/C ==== {df_5_final.count()}")
+        
+
+
+        
+        circle_profit = read_oracle(spark, "(SELECT * FROM p_l_transfer WHERE branch_code  = circle_branch_code) T1")
+        circle_profit = circle_profit.withColumn("CGL",lit("2110505001")) \
+        .withColumn("CURRENCY",lit("INR")) \
+        .withColumn("BALANCE",col("PROFIT_LOSS")) \
+        .withColumn("INR_BALANCE",col("PROFIT_LOSS")) \
+        .withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date"))
+    
+        common_cols = ["CGL", "CURRENCY", "BRANCH_CODE", "BALANCE_DATE", "BALANCE", "INR_BALANCE"]
+        
+        print(f"===========================>df_circle_final")
+        #df_circle_final.show(500,False)
+        print(f"===========================>df_general_final")
+        #df_general_final.show(500,False)
+        print(f"===========================>df_5_final")
+        #df_5_final.show(500,False)
+        print(f"===========================>circle_profit")
+        #circle_profit.show(500,False)
+
+        opening_balance_df = df_78_final.select(*common_cols) \
+                                .unionByName(df_circle_final.select(*common_cols)) \
+                                .unionByName(df_general_final.select(*common_cols)) \
+                                .unionByName(df_5_final.select(*common_cols)) \
+                                .unionByName(circle_profit.select(*common_cols))
+
+                                
+        opening_balance_df = opening_balance_df.groupBy("CGL","CURRENCY","BRANCH_CODE").agg(
+            F.sum("BALANCE").alias("BALANCE"),
+            F.sum("INR_BALANCE").alias("INR_BALANCE"),
+        ).withColumn("BALANCE_DATE",lit(etl_plus_1_str).cast("date")).select(*common_cols)
+        opening_balance_df.cache()
+
+        ## opening_balance_df.show(200, False)
+        log_etl(spark, process_run_id, "creating_opening_bal", 2, "Opening balance created")
+    else:
+        logger.info("=== No active financial year. Skipping ===")
+        log_etl(spark, process_run_id, "year_end_rule", 1, "Skipped: Inactive Year")
