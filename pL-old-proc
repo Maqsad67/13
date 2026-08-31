@@ -1,0 +1,670 @@
+create or replace PROCEDURE PROC_PRIOR_PROFIT_TRANSFER (
+    p_adjustment_date IN DATE
+) AS
+    v_batch_id     NUMBER;
+    v_journal_id   NUMBER;
+    v_record_count NUMBER;
+BEGIN
+   ------------------------------------------------------------------
+   -- GET IDS
+   ------------------------------------------------------------------
+    v_batch_id := get_next_batch_id;
+    v_journal_id := get_next_journal_id;
+    dbms_output.put_line('Batch ID   : ' || v_batch_id);
+    dbms_output.put_line('Journal ID : ' || v_journal_id);
+   ------------------------------------------------------------------
+   -- CHECK EXISTING DATA
+   ------------------------------------------------------------------
+    SELECT
+        COUNT(*)
+    INTO v_record_count
+    FROM
+        p_l_transfer_transactions
+    WHERE
+            trunc(transaction_date) = trunc(p_adjustment_date)
+        AND source_flag = 'A';
+
+    IF v_record_count > 0 THEN
+        dbms_output.put_line('Existing records found for '
+                             || to_char(p_adjustment_date, 'DD-MON-YYYY')
+                             || '. Deleting old data.');
+        DELETE FROM p_l_transfer_balance
+        WHERE
+            trunc(balance_date) = trunc(p_adjustment_date);
+
+        DELETE FROM p_l_transfer_transactions
+        WHERE
+                trunc(transaction_date) = trunc(p_adjustment_date)
+            AND source_flag = 'A';
+
+        DELETE FROM p_l_transfer
+        WHERE
+            trunc(transfer_date) = trunc(p_adjustment_date);
+
+    END IF;
+   ------------------------------------------------------------------
+   -- NEXT STEP:
+   -- POPULATE TEMP_PL_TRANSFER_TRANSACTIONS
+   ------------------------------------------------------------------
+    INSERT INTO temp_pl_transfer_transactions (
+        circle_code,
+        batch_id,
+        transaction_count,
+        branch_code,
+        currency,
+        cgl,
+        debit_amount,
+        credit_amount,
+        transaction_date,
+        source_flag,
+        journal_id,
+        narration
+    )
+        WITH base AS (
+            SELECT
+                branch_code,
+                'INR'       AS currency,
+                cgl,
+                inr_balance AS balance,
+                balance_date
+            FROM
+                gl_balance
+            WHERE
+                    trunc(balance_date) = trunc(p_adjustment_date)
+                AND ( cgl LIKE '7%'
+                      OR cgl LIKE '8%' )
+        ), base_circle AS (
+            SELECT
+                a.code        AS branch_code,
+                b.branch_code AS circle_code
+            FROM
+                branch_master a
+                LEFT OUTER JOIN circle_master b ON a.circle_code = b.circle_code
+            WHERE
+                NOT EXISTS (
+                    SELECT
+                        1
+                    FROM
+                        circle_master b2
+                    WHERE
+                        a.code = b2.branch_code
+                )
+        ), df_without_circle AS (
+            SELECT
+                b.branch_code,
+                bc.circle_code,
+                SUM(b.balance) AS balance
+            FROM
+                base        b
+                LEFT JOIN base_circle bc ON b.branch_code = bc.branch_code
+            WHERE
+                bc.circle_code IS NOT NULL
+            GROUP BY
+                b.branch_code,
+                bc.circle_code
+        ), p_l_transactions_raw AS (
+            SELECT
+                circle_code,
+                v_batch_id   AS batch_id,
+                1            AS transaction_count,
+                branch_code,
+                'INR'        AS currency,
+                '2110505001' AS cgl,
+                CASE
+                    WHEN balance <= 0 THEN
+                        abs(balance)
+                    ELSE
+                        0
+                END          AS credit_amount,
+                CASE
+                    WHEN balance > 0 THEN
+                        - balance
+                    ELSE
+                        0
+                END          AS debit_amount
+            FROM
+                df_without_circle
+            UNION ALL
+            SELECT
+                circle_code,
+                v_batch_id,
+                1,
+                branch_code,
+                'INR',
+                '1106505001',
+                CASE
+                    WHEN balance > 0 THEN
+                        balance
+                    ELSE
+                        0
+                END,
+                CASE
+                    WHEN balance <= 0 THEN
+                        balance
+                    ELSE
+                        0
+                END
+            FROM
+                df_without_circle
+            UNION ALL
+            SELECT
+                circle_code,
+                v_batch_id,
+                1,
+                circle_code,
+                'INR',
+                '1106505001',
+                CASE
+                    WHEN balance <= 0 THEN
+                        abs(balance)
+                    ELSE
+                        0
+                END,
+                CASE
+                    WHEN balance > 0 THEN
+                        - balance
+                    ELSE
+                        0
+                END
+            FROM
+                df_without_circle
+            UNION ALL
+            SELECT
+                circle_code,
+                v_batch_id,
+                1,
+                circle_code,
+                'INR',
+                '2110505001',
+                CASE
+                    WHEN balance > 0 THEN
+                        balance
+                    ELSE
+                        0
+                END,
+                CASE
+                    WHEN balance <= 0 THEN
+                        balance
+                    ELSE
+                        0
+                END
+            FROM
+                df_without_circle
+        )
+        SELECT
+            circle_code,
+            batch_id,
+            transaction_count,
+            branch_code,
+            currency,
+            cgl,
+            debit_amount,
+            credit_amount,
+            p_adjustment_date,
+            'A',
+            v_journal_id,
+            'P and L Prior Adjustment for Circle ' || circle_code
+        FROM
+            p_l_transactions_raw;
+
+    DBMS_OUTPUT.PUT_LINE(
+   'Temp Transaction Rows : ' ||
+   SQL%ROWCOUNT
+                );
+
+    ------------------------------------------------------------------
+   -- INSERT INTO P_L_TRANSFER_TRANSACTIONS
+   ------------------------------------------------------------------
+   INSERT INTO P_L_TRANSFER_TRANSACTIONS
+   (
+       CIRCLE_CODE,
+       BATCH_ID,
+       TRANSACTION_COUNT,
+       BRANCH_CODE,
+       CURRENCY,
+       CGL,
+       DEBIT_AMOUNT,
+       CREDIT_AMOUNT,
+       TRANSACTION_DATE,
+       SOURCE_FLAG,
+       JOURNAL_ID,
+       NARRATION
+   )
+   SELECT
+       CIRCLE_CODE,
+       BATCH_ID,
+       TRANSACTION_COUNT,
+       BRANCH_CODE,
+       CURRENCY,
+       CGL,
+       DEBIT_AMOUNT,
+       CREDIT_AMOUNT,
+       TRANSACTION_DATE,
+       SOURCE_FLAG,
+       JOURNAL_ID,
+       NARRATION
+   FROM TEMP_PL_TRANSFER_TRANSACTIONS;
+   DBMS_OUTPUT.PUT_LINE(
+       'Inserted into P_L_TRANSFER_TRANSACTIONS : '
+       || SQL%ROWCOUNT
+   );
+
+    ------------------------------------------------------------------
+   -- INSERT INTO P_L_TRANSFER_BALANCE
+   ------------------------------------------------------------------
+   INSERT INTO P_L_TRANSFER_BALANCE
+   (
+       BRANCH_CODE,
+       CURRENCY,
+       CGL,
+       BALANCE,
+       INR_BALANCE,
+       BALANCE_DATE,
+       ACTIVITY_FLAG
+   )
+   SELECT
+       BRANCH_CODE,
+       CURRENCY,
+       CGL,
+       SUM(CREDIT_AMOUNT + DEBIT_AMOUNT) AS BALANCE,
+       SUM(CREDIT_AMOUNT + DEBIT_AMOUNT) AS INR_BALANCE,
+       P_ADJUSTMENT_DATE,
+       'A'
+   FROM TEMP_PL_TRANSFER_TRANSACTIONS
+   GROUP BY
+       BRANCH_CODE,
+       CURRENCY,
+       CGL;
+   DBMS_OUTPUT.PUT_LINE(
+       'Inserted into P_L_TRANSFER_BALANCE : '
+       || SQL%ROWCOUNT
+   );             
+
+
+     ------------------------------------------------------------------
+   -- INSERT INTO P_L_TRANSFER
+   ------------------------------------------------------------------
+   INSERT INTO P_L_TRANSFER
+   (
+       BRANCH_CODE,
+       CIRCLE_BRANCH_CODE,
+       PROFIT_LOSS,
+       TRANSFER_DATE,
+       ACTIVITY_FLAG
+   )
+   WITH base AS (
+       SELECT
+           BRANCH_CODE,
+           CURRENCY,
+           CGL,
+           INR_BALANCE AS BALANCE,
+           BALANCE_DATE
+       FROM GL_BALANCE
+       WHERE TRUNC(BALANCE_DATE) = TRUNC(P_ADJUSTMENT_DATE)
+         AND (CGL LIKE '7%' OR CGL LIKE '8%')
+   ),
+   base_branch AS (
+       SELECT
+           A.CODE AS BRANCH_CODE,
+           B.BRANCH_CODE AS CIRCLE_CODE
+       FROM BRANCH_MASTER A
+       LEFT OUTER JOIN CIRCLE_MASTER B
+           ON A.CIRCLE_CODE = B.CIRCLE_CODE
+   ),
+   df_with_all_pl AS (
+       SELECT
+           b.BRANCH_CODE,
+           bb.CIRCLE_CODE AS CIRCLE_BRANCH_CODE,
+           SUM(b.BALANCE) AS PROFIT_LOSS,
+           P_ADJUSTMENT_DATE AS TRANSFER_DATE,
+           'A' AS ACTIVITY_FLAG
+       FROM base b
+       LEFT JOIN base_branch bb
+           ON b.BRANCH_CODE = bb.BRANCH_CODE
+       GROUP BY
+           b.BRANCH_CODE,
+           bb.CIRCLE_CODE
+   )
+   SELECT
+       BRANCH_CODE,
+       CIRCLE_BRANCH_CODE,
+       PROFIT_LOSS,
+       TRANSFER_DATE,
+       ACTIVITY_FLAG
+   FROM df_with_all_pl;
+   DBMS_OUTPUT.PUT_LINE(
+       'Inserted into P_L_TRANSFER : '
+       || SQL%ROWCOUNT
+   );
+
+  
+   DBMS_OUTPUT.PUT_LINE(
+       'Procedure completed successfully.'
+   );
+
+
+
+
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+           DBMS_OUTPUT.PUT_LINE(
+           'Error : ' || SQLERRM
+       );
+
+        RAISE;
+END PROC_PRIOR_PROFIT_TRANSFER;
+
+
+
+
+
+
+
+
+
+
+
+
+-- SET SERVEROUTPUT ON;
+-- BEGIN
+--    PROC_PL_PRIOR_ADJUSTMENT(
+--        DATE '2026-03-31'
+--    );
+-- END;
+-- /
+
+
+CREATE OR REPLACE PROCEDURE PROC_PRIOR_PROFIT_POSTING
+(
+P_ADJUSTMENT_DATE IN DATE
+)
+AS
+V_BALANCE_COUNT       NUMBER;
+V_TRANSACTION_COUNT number;
+BEGIN
+
+------------------------------------------------------------------
+-- MERGE INTO GL_BAL
+------------------------------------------------------------------
+    MERGE INTO gl_bal target
+    USING (
+        SELECT
+            cgl,
+            currency,
+            branch_code,
+            balance,
+            inr_balance,
+            balance_date
+        FROM
+            p_l_transfer_balance
+        WHERE
+                trunc(balance_date) = trunc(p_adjustment_date)
+            AND activity_flag = 'A'
+    ) source ON ( target.cgl = source.cgl
+                  AND target.currency = source.currency
+                      AND target.branch_code = source.branch_code
+                          AND trunc(target.balance_date) = trunc(source.balance_date) )
+    WHEN MATCHED THEN UPDATE
+    SET target.balance = nvl(target.balance, 0) + source.balance,
+        target.inr_balance = nvl(target.inr_balance, 0) + source.inr_balance
+    WHEN NOT MATCHED THEN
+    INSERT (
+        cgl,
+        currency,
+        branch_code,
+        balance,
+        inr_balance,
+        balance_date )
+    VALUES
+        ( source.cgl,
+          source.currency,
+          source.branch_code,
+          source.balance,
+          source.inr_balance,
+          source.balance_date );
+
+    dbms_output.put_line('GL_BAL Merge Completed');
+    dbms_output.put_line('Rows Merged:' || SQL%rowcount );            `
+------------------------------------------------------------------
+
+-- INSERT INTO GL_TRANSACTIONS
+
+------------------------------------------------------------------
+
+    INSERT INTO gl_transactions (
+        cgl,
+        currency,
+        branch_code,
+        narration,
+        source_flag,
+        batch_id,
+        debit_amount,
+        credit_amount,
+        transaction_count,
+        journal_id,
+        transaction_date
+    )
+        SELECT
+            cgl,
+            currency,
+            branch_code,
+            narration,
+            source_flag,
+            batch_id,
+            debit_amount,
+            credit_amount,
+            transaction_count,
+            journal_id,
+            transaction_date
+        FROM
+            p_l_transfer_transactions
+        WHERE
+                trunc(transaction_date) = trunc(p_adjustment_date)
+            AND source_flag = 'A';
+
+    dbms_output.put_line('GL_TRANSACTIONS Inserted : ' || SQL%rowcount);
+
+
+    dbms_output.put_line('Profit Posting Completed Successfully');
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        dbms_output.put_line('Profit Posting Failed : ' || sqlerrm);
+        RAISE;
+END PROC_PRIOR_PROFIT_POSTING;
+/
+ 
+
+
+
+-- SET SERVEROUTPUT ON;
+-- BEGIN
+--    PROC_PROFIT_POSTING(
+--        DATE '2026-03-31'
+--    );
+-- END;
+-- / 
+WITH
+    base_data AS (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE,
+            INR_BALANCE,
+            '01-APR-26' AS BALANCE_DATE
+        FROM
+            GL_BALANCE_PRIOR_ADJUSTMENT
+        WHERE
+            TRUNC (BALANCE_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+    ),
+    fwd_base AS (
+        SELECT
+            B.CGL,
+            B.CURRENCY,
+            B.BRANCH_CODE,
+            B.BALANCE,
+            B.INR_BALANCE,
+            B.BALANCE_DATE
+        FROM
+            base_data B
+            INNER JOIN CGL_MASTER C ON TRIM(B.CGL) = TRIM(C.CGL_NUMBER)
+        WHERE
+            C.BAL_FWD = 1
+    ),
+    rule_78 AS (
+        -- ——————————————————————
+        -- – ORIGINAL FOREIGN CURRENCY ROWS
+        -- ——————————————————————
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM
+            base_data
+        WHERE
+            REGEXP_LIKE (CGL, '^[78]')
+            AND TRIM(CURRENCY) <> 'INR'
+        UNION ALL
+        ------------------------------------------------------------------
+        -- OFFSET INR ROWS
+        ------------------------------------------------------------------
+        SELECT
+            CGL,
+            'INR' AS CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            - INR_BALANCE AS BALANCE,
+            - INR_BALANCE AS INR_BALANCE
+        FROM
+            base_data
+        WHERE
+            REGEXP_LIKE (CGL, '^[78]')
+            AND TRIM(CURRENCY) <> 'INR'
+    ),
+    rule_circle AS (
+        SELECT
+            F.CGL,
+            F.CURRENCY,
+            F.BRANCH_CODE,
+            F.BALANCE_DATE,
+            F.BALANCE,
+            F.INR_BALANCE
+        FROM
+            fwd_base F
+            INNER JOIN (
+                SELECT DISTINCT
+                    BRANCH_CODE
+                FROM
+                    CIRCLE_MASTER
+                WHERE
+                    BRANCH_CODE IS NOT NULL
+            ) C ON F.BRANCH_CODE = C.BRANCH_CODE
+        WHERE
+            F.CGL = '2110505001'
+    ),
+    rule_general AS (
+        SELECT
+            CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            BALANCE_DATE,
+            BALANCE,
+            INR_BALANCE
+        FROM
+            fwd_base
+        WHERE
+            NOT REGEXP_LIKE (CGL, '^[78]')
+            AND CGL <> '2110505001'
+    ),
+    rule_5 AS (
+        SELECT
+            '5000000000' AS CGL,
+            CURRENCY,
+            BRANCH_CODE,
+            '01-APR-26' AS BALANCE_DATE,
+            - SUM(BALANCE) AS BALANCE,
+            - SUM(INR_BALANCE) AS INR_BALANCE
+        FROM
+            GL_BAL B
+        WHERE
+            TRUNC (B.BALANCE_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+            AND B.CGL LIKE '5%'
+            AND EXISTS (
+                SELECT
+                    1
+                FROM
+                    CGL_MASTER C
+                WHERE
+                    TRIM(C.CGL_NUMBER) = TRIM(B.CGL)
+                    AND C.BAL_FWD = 1
+            )
+        GROUP BY
+            BRANCH_CODE,
+            CURRENCY
+    ),
+    circle_profit AS (
+        SELECT
+            '2110505001' AS CGL,
+            'INR' AS CURRENCY,
+            BRANCH_CODE,
+            '01-APR-26' AS BALANCE_DATE,
+            PROFIT_LOSS AS BALANCE,
+            PROFIT_LOSS AS INR_BALANCE
+        FROM
+            P_L_TRANSFER
+        WHERE
+            BRANCH_CODE = CIRCLE_BRANCH_CODE
+            AND ACTIVITY_FLAG = 'A'
+            AND TRUNC (TRANSFER_DATE) = TO_DATE( :P_ADJUSTMENT_DATE  ,'dd-mm-yyyy')
+    ),
+    opening_balance AS (
+        SELECT
+            *
+        FROM
+            rule_78
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_circle
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_general
+        UNION ALL
+        SELECT
+            *
+        FROM
+            rule_5
+        UNION ALL
+        SELECT
+            *
+        FROM
+            circle_profit
+    )
+SELECT
+    v_batch_id,
+    BRANCH_CODE,
+    CGL,
+    CURRENCY,
+    '01-APR-26' AS BALANCE_DATE,
+    SUM(BALANCE) AS BALANCE,
+    SUM(INR_BALANCE) AS INR_BALANCE
+FROM
+    opening_balance
+GROUP BY
+    CGL,
+    CURRENCY,
+    BRANCH_CODE
+ORDER BY
+    CGL,
+    CURRENCY,
+    BRANCH_CODE;
+
